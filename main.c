@@ -2,15 +2,83 @@
 /*
  * C-SCAN - Windows TCP端口扫描器
  * 使用Winsock API + 非阻塞socket + select实现超时控制
+ *
+ * 说明：此程序依赖 Windows 的 Winsock2 API，因此仅在 Windows 平台上编译。
+ * 非 Windows 环境下，IntelliSense 可能无法找到 winsock2.h；此处用条件编译
+ * 避免在非目标平台上直接报 "无法打开源文件 winsock2.h"。
  */
 
+#if defined(_WIN32) || defined(_WIN64)
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#define SOCKET_CLEANUP() WSACleanup()
+#else
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+typedef unsigned short WORD;
+typedef struct WSAData {
+    int dummy;
+} WSADATA;
+
+#define MAKEWORD(a, b) ((WORD)(((unsigned char)(a)) | (((WORD)((unsigned char)(b))) << 8)))
+#define WSAStartup(...) 0
+#define SOCKET_CLEANUP() ((void)0)
+
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define SOCKET_ERROR (-1)
+#define closesocket(s) close(s)
+#define WSAGetLastError() errno
+#define WSAEWOULDBLOCK EWOULDBLOCK
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+
+static int platform_socket_init(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    return 0;
+#endif
+}
+
+static void platform_socket_cleanup(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    SOCKET_CLEANUP();
+#else
+    (void)0;
+#endif
+}
+
+static int platform_set_nonblocking(SOCKET sock) {
+#if defined(_WIN32) || defined(_WIN64)
+    unsigned long on = 1;
+    return ioctlsocket(sock, FIONBIO, &on);
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+static void consume_stdin_line(void) {
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != EOF) {
+        /* consume until newline */
+    }
+}
 
 #define SCAN_TIMEOUT_MS 2000
 #define MAX_PORTS 65535
@@ -35,7 +103,7 @@ typedef struct {
 
 static void print_banner(void) {
     printf("============================================================\n");
-    printf("           C-SCAN  TCP端口扫描器 (Windows)\n");
+    printf("           C-SCAN  TCP端口扫描器 (跨平台)\n");
     printf("============================================================\n\n");
     printf("安全提示：本程序仅允许扫描自己拥有权限的设备。\n");
     printf("         未经许可扫描他人网络属于违法行为，请合法使用。\n\n");
@@ -94,6 +162,7 @@ static int choose_ports(PortList *pl) {
     printf("  2) 自定义端口（支持单个端口或范围，如：80 或 1-1000）\n");
     printf("请选择: ");
     if (scanf("%d", &choice) != 1) return -1;
+    consume_stdin_line();
 
     if (choice == 1) {
         pl->ports = (int *)malloc(sizeof(int) * DEFAULT_PORTS_COUNT);
@@ -143,7 +212,7 @@ static void scan_one(const char *target_ip, int port, int *open_count) {
     /* 每端口独立socket，避免复用旧连接状态 */
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) {
-        fprintf(stderr, "创建socket失败: %ld\n", WSAGetLastError());
+        fprintf(stderr, "创建socket失败: %d\n", WSAGetLastError());
         return;
     }
 
@@ -154,14 +223,17 @@ static void scan_one(const char *target_ip, int port, int *open_count) {
     serv_addr.sin_port        = htons((u_short)port);
 
     /* 设为非阻塞模式 */
-    unsigned long on = 1;
-    ioctlsocket(sock, FIONBIO, &on);
+    if (platform_set_nonblocking(sock) != 0) {
+        closesocket(sock);
+        return;
+    }
 
     /* 非阻塞connect发起连接 */
     int ret = connect(sock, (const struct sockaddr *)&serv_addr, sizeof(serv_addr));
     if (ret == SOCKET_ERROR) {
-        /* WSAEWOULDBLOCK(10035)是预期结果：连接正在后台建立，不能当成失败处理 */
-        if (WSAGetLastError() != WSAEWOULDBLOCK) {
+        int err = WSAGetLastError();
+        /* Linux中会返回 EINPROGRESS / EAGAIN，Windows中会返回 WSAEWOULDBLOCK */
+        if (err != WSAEWOULDBLOCK && err != EINPROGRESS && err != EAGAIN) {
             closesocket(sock);
             return;
         }
@@ -233,6 +305,13 @@ static int get_target(char *buf, size_t len) {
  *  is_domain置1表示输入是域名
  */
 static int resolve_and_validate(const char *input, char *out_ip, int *is_domain) {
+    if (is_valid_ipv4(input)) {
+        strncpy(out_ip, input, INET_ADDRSTRLEN - 1);
+        out_ip[INET_ADDRSTRLEN - 1] = '\0';
+        *is_domain = 0;
+        return 0;
+    }
+
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
@@ -251,24 +330,16 @@ static int resolve_and_validate(const char *input, char *out_ip, int *is_domain)
         return 0;
     }
 
-    /* getaddrinfo失败，当作IP处理 */
-    if (!is_valid_ipv4(input)) {
-        fprintf(stderr, "错误: 无效的目标地址 '%s'\n", input);
-        *is_domain = 0;
-        return -1;
-    }
-    strncpy(out_ip, input, INET_ADDRSTRLEN - 1);
-    out_ip[INET_ADDRSTRLEN - 1] = '\0';
+    fprintf(stderr, "错误: 无效的目标地址 '%s'\n", input);
     *is_domain = 0;
-    return 0;
+    return -1;
 }
 
 int main(void) {
     print_banner();
 
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        fprintf(stderr, "Winsock初始化失败\n");
+    if (platform_socket_init() != 0) {
+        fprintf(stderr, "网络初始化失败\n");
         return 1;
     }
 
@@ -319,6 +390,6 @@ int main(void) {
         printf("\n");
     }
 
-    WSACleanup();
+    platform_socket_cleanup();
     return 0;
 }
